@@ -1,11 +1,10 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from anthropic import Anthropic
 from dotenv import load_dotenv
 import os
 import re
-import json
+import httpx
 from datetime import datetime
 
 load_dotenv()
@@ -19,9 +18,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-# Audit log store
 audit_logs = []
 stats = {
     "total_requests": 0,
@@ -31,7 +30,6 @@ stats = {
     "allowed_requests": 0,
 }
 
-# PHI patterns (HIPAA)
 PHI_PATTERNS = {
     "SSN": r'\b\d{3}-\d{2}-\d{4}\b',
     "Phone": r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b',
@@ -41,7 +39,6 @@ PHI_PATTERNS = {
     "CreditCard": r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b',
 }
 
-# Injection patterns
 INJECTION_PATTERNS = [
     r'ignore previous instructions',
     r'ignore all instructions',
@@ -53,6 +50,8 @@ INJECTION_PATTERNS = [
     r'dan mode',
     r'bypass.*filter',
     r'override.*policy',
+    r'reveal.*patient',
+    r'admin mode',
 ]
 
 class PromptRequest(BaseModel):
@@ -60,25 +59,12 @@ class PromptRequest(BaseModel):
     user_id: str = "anonymous"
     department: str = "general"
 
-class AnalysisResult(BaseModel):
-    status: str
-    risk_score: int
-    phi_detected: list
-    injection_detected: bool
-    action: str
-    masked_prompt: str
-    reason: str
-
 def detect_phi(text: str):
     detected = []
     for phi_type, pattern in PHI_PATTERNS.items():
         matches = re.findall(pattern, text, re.IGNORECASE)
         if matches:
-            detected.append({
-                "type": phi_type,
-                "count": len(matches),
-                "masked": True
-            })
+            detected.append({"type": phi_type, "count": len(matches), "masked": True})
     return detected
 
 def detect_injection(text: str):
@@ -101,15 +87,35 @@ def calculate_risk_score(phi_detected, injection_detected):
     score += len(phi_detected) * 15
     return min(score, 100)
 
+async def call_gemini(prompt: str):
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                GEMINI_URL,
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"maxOutputTokens": 500}
+                }
+            )
+            data = response.json()
+            if "candidates" in data and len(data["candidates"]) > 0:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            elif "error" in data:
+                return f"Gemini API Error: {data['error']['message']}"
+            else:
+                return f"Unexpected response: {str(data)[:200]}"
+    except Exception as e:
+        return f"Gemini Error: {str(e)}"
+
 @app.post("/analyze")
 async def analyze_prompt(request: PromptRequest):
     stats["total_requests"] += 1
-    
+
     phi_detected = detect_phi(request.prompt)
     injection_detected = detect_injection(request.prompt)
     risk_score = calculate_risk_score(phi_detected, injection_detected)
     masked_prompt = mask_phi(request.prompt)
-    
+
     if injection_detected:
         action = "BLOCKED"
         reason = "Prompt injection attack detected"
@@ -122,7 +128,7 @@ async def analyze_prompt(request: PromptRequest):
         stats["pii_detected"] += 1
     elif len(phi_detected) > 0:
         action = "MASKED_AND_ALLOWED"
-        reason = "PHI detected and masked before LLM call"
+        reason = "PHI detected and masked before Gemini call"
         stats["pii_detected"] += 1
         stats["allowed_requests"] += 1
     else:
@@ -146,15 +152,7 @@ async def analyze_prompt(request: PromptRequest):
 
     llm_response = None
     if action in ["ALLOWED", "MASKED_AND_ALLOWED"]:
-        try:
-            message = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=500,
-                messages=[{"role": "user", "content": masked_prompt}]
-            )
-            llm_response = message.content[0].text
-        except Exception as e:
-            llm_response = f"LLM Error: {str(e)}"
+        llm_response = await call_gemini(masked_prompt)
 
     return {
         "status": "success",
@@ -174,7 +172,6 @@ async def get_stats():
     if stats["total_requests"] > 0:
         breach_rate = stats["pii_detected"] / stats["total_requests"]
         compliance_score = max(0, int(100 - (breach_rate * 50)))
-    
     return {
         **stats,
         "compliance_score": compliance_score,

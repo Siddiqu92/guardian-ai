@@ -1,0 +1,3 @@
+[submodule "lobstertrap"]
+	path = lobstertrap
+	url = https://github.com/veeainc/lobstertrap.git
